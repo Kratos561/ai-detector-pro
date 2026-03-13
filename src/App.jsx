@@ -5,7 +5,7 @@ import { Header } from './components/Header'
 import { motion, AnimatePresence } from 'framer-motion'
 import { ShieldCheck, Activity } from 'lucide-react'
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+const API_URL = import.meta.env.VITE_API_URL || '/api'
 
 function App() {
   const [isAnalyzing, setIsAnalyzing] = useState(false)
