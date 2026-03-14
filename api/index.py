@@ -306,5 +306,6 @@ async def analyze_file(file: UploadFile = File(...)):
     return result
 
 
-# Registrar rutas — Vercel hace el routing via vercel.json rewrites
+# Registrar rutas — Vercel hace el routing via vercel.json rewrites y envía /api/...
 app.include_router(router)
+app.include_router(router, prefix="/api")
