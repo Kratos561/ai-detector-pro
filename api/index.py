@@ -1,18 +1,17 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import textwrap
 import math
 import re
 import io
+import statistics
 
-app = FastAPI(title="AI Detector Pro API", version="1.0.0")
+app = FastAPI(title="AI Detector Pro API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # En producción se reemplaza con el dominio de Render
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -29,11 +28,16 @@ def extract_text_from_pdf(content: bytes) -> str:
     try:
         import pdfplumber
         with pdfplumber.open(io.BytesIO(content)) as pdf:
-            return "\n".join(
-                page.extract_text() or "" for page in pdf.pages
-            )
-    except Exception:
-        raise HTTPException(status_code=422, detail="No se pudo leer el PDF. Instala pdfplumber.")
+            text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+            if not text.strip():
+                raise HTTPException(status_code=422, detail="El PDF no contiene texto extraíble.")
+            return text
+    except ImportError:
+        raise HTTPException(status_code=501, detail="Soporte de PDF no disponible en este entorno.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"No se pudo leer el PDF: {str(e)[:100]}")
 
 
 def extract_text_from_docx(content: bytes) -> str:
@@ -41,8 +45,10 @@ def extract_text_from_docx(content: bytes) -> str:
         from docx import Document
         doc = Document(io.BytesIO(content))
         return "\n".join(p.text for p in doc.paragraphs)
-    except Exception:
-        raise HTTPException(status_code=422, detail="No se pudo leer el DOCX. Instala python-docx.")
+    except ImportError:
+        raise HTTPException(status_code=501, detail="Soporte de DOCX no disponible en este entorno.")
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"No se pudo leer el DOCX: {str(e)[:100]}")
 
 
 def extract_text_from_image(content: bytes) -> str:
@@ -51,8 +57,10 @@ def extract_text_from_image(content: bytes) -> str:
         from PIL import Image
         img = Image.open(io.BytesIO(content))
         return pytesseract.image_to_string(img)
-    except Exception:
-        raise HTTPException(status_code=422, detail="No se pudo leer la imagen. Instala pytesseract y Pillow.")
+    except ImportError:
+        raise HTTPException(status_code=501, detail="OCR no disponible en este entorno. Sube un archivo de texto.")
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"No se pudo leer la imagen: {str(e)[:100]}")
 
 
 EXTRACTORS = {
@@ -77,90 +85,163 @@ EXTRACTORS = {
 
 
 # ─────────────────────────────────────────────
-# MOTOR DE ANÁLISIS DE IA
+# MOTOR DE ANÁLISIS v2 (inspirado en GPTZero + Turnitin)
 # ─────────────────────────────────────────────
 
-def calculate_perplexity(text: str) -> float:
+# Lista expandida de "AI-isms" basada en investigación de GPTZero y corpus de LLMs
+AI_MARKERS = [
+    # Transiciones clásicas de IA
+    "additionally", "furthermore", "moreover", "therefore", "consequently",
+    "nevertheless", "notwithstanding", "henceforth", "heretofore",
+    # Frases de relleno
+    "it is worth noting", "it should be noted", "it is important to note",
+    "it's important to note", "in conclusion", "in summary", "to summarize",
+    "importantly", "significantly", "essentially", "fundamentally",
+    "comprehensively", "notably", "remarkably", "undoubtedly",
+    # Verbos "IA"
+    "delve", "elucidate", "leverage", "underscore", "resonate", "unveil",
+    "embark", "unleash", "navigate", "showcase", "foster", "cultivate",
+    "harness", "streamline", "revolutionize", "empower", "facilitate",
+    # Adjetivos "IA"
+    "meticulous", "intricate", "comprehensive", "transformative", "vibrant",
+    "pivotal", "crucial", "vital", "robust", "dynamic", "innovative",
+    "cutting-edge", "state-of-the-art", "multifaceted", "nuanced",
+    # Frases cliché de IA
+    "in the realm of", "as we navigate", "by leveraging", "in the ever-evolving",
+    "tapestry of", "at the pinnacle", "landscape of", "paradigm shift",
+    "in today's fast-paced", "it goes without saying", "needless to say",
+    "the bottom line is", "at the end of the day", "last but not least",
+]
+
+
+def calculate_perplexity_v2(text: str) -> float:
     """
-    Aproximación heurística de perplejidad basada en proporción
-    de palabras comunes de 'relleno' en textos de IA.
+    Perplejidad mejorada basada en diversidad léxica y densidad de marcadores de IA.
+    Inspirada en el modelo de GPTZero.
     """
-    ai_filler_words = [
-        "additionally", "furthermore", "moreover", "therefore", "consequently",
-        "nevertheless", "notwithstanding", "henceforth", "heretofore",
-        "it is worth noting", "it should be noted", "in conclusion",
-        "in summary", "to summarize", "importantly", "significantly",
-        "essentially", "fundamentally", "comprehensively", "delve", "elucidate",
-        "in the realm of", "as we navigate", "by leveraging",
-    ]
     words = text.lower().split()
-    if len(words) == 0:
+    if not words:
         return 50.0
-    filler_count = sum(1 for w in ai_filler_words if w in text.lower())
-    # Perplejidad baja → texto más predecible → más IA
-    base = 80.0 - (filler_count * 8)
-    return max(10.0, min(100.0, base))
+
+    # Diversidad léxica (Type-Token Ratio): más diversidad = más humano = más perplejidad
+    unique_ratio = len(set(words)) / len(words)
+
+    # Análisis de bigrams: IA repite combinaciones de palabras
+    if len(words) > 1:
+        bigrams = [f"{words[i]} {words[i+1]}" for i in range(len(words)-1)]
+        unique_bigrams_ratio = len(set(bigrams)) / len(bigrams)
+    else:
+        unique_bigrams_ratio = 1.0
+
+    # Densidad de marcadores de IA
+    text_lower = text.lower()
+    marker_count = sum(1 for m in AI_MARKERS if m in text_lower)
+    marker_density = marker_count / len(AI_MARKERS)
+
+    # Perplejidad: más diversidad + menos marcadores = más perplejidad (más humano)
+    perplexity = (unique_ratio * 45) + (unique_bigrams_ratio * 35) - (marker_density * 40) + 20
+    return max(5.0, min(100.0, perplexity))
 
 
-def calculate_burstiness(text: str) -> float:
+def calculate_burstiness_v2(text: str) -> float:
     """
-    Calcula la variabilidad en longitud de oraciones.
-    Baja variabilidad = IA (oraciones uniformes).
+    Burstiness real basada en coeficiente de variación de longitud de oraciones.
+    Turnitin usa este método: humanos tienen picos, IA mantiene uniformidad.
     """
     sentences = re.split(r'(?<=[.!?])\s+', text.strip())
-    if len(sentences) < 2:
+    sentences = [s.strip() for s in sentences if len(s.split()) > 1]
+
+    if len(sentences) < 3:
         return 50.0
-    lengths = [len(s.split()) for s in sentences if len(s.split()) > 0]
-    if not lengths:
+
+    lengths = [len(s.split()) for s in sentences]
+
+    try:
+        mean = statistics.mean(lengths)
+        if mean == 0:
+            return 50.0
+        std = statistics.stdev(lengths)
+        # Coeficiente de variación: alta variación = más humano = más burstiness
+        cv = (std / mean) * 100
+        return min(100.0, cv * 1.2)
+    except Exception:
         return 50.0
-    mean_len = sum(lengths) / len(lengths)
-    variance = sum((l - mean_len) ** 2 for l in lengths) / len(lengths)
-    std_dev = math.sqrt(variance)
-    # Normalizar: std_dev alta → burstiness alta → más humano
-    return min(100.0, std_dev * 4)
 
 
-def detect_ai_patterns(text: str) -> dict:
-    """Detecta patrones específicos de escritura IA."""
-    ai_patterns = [
-        r"\bdelve\b", r"\bcomprehensive\b", r"\bin conclusion\b",
-        r"\bit is important to note\b", r"\bfurthermore\b",
-        r"\badditionally,\b", r"\bmoreover\b", r"\bnevertheless\b",
-        r"\bin summary\b", r"\bto summarize\b",
-    ]
-    found = [p for p in ai_patterns if re.search(p, text.lower())]
-    return {
-        "patterns_found": len(found),
-        "patterns": [p.strip(r'\b') for p in found[:5]],
-    }
+def analyze_per_sentence(text: str) -> list:
+    """
+    Análisis oración por oración inspirado en el método de Turnitin.
+    Cada oración recibe un score de 0 (humano) a 1 (IA).
+    """
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    sentences = [s.strip() for s in sentences if len(s.split()) > 3][:20]  # Cap en 20
+
+    scored = []
+    text_lower = text.lower()
+    for sentence in sentences:
+        s_lower = sentence.lower()
+        # Contar marcadores de IA en esta oración
+        markers_in_sentence = sum(1 for m in AI_MARKERS if m in s_lower)
+        # Uniformidad de longitud de palabras
+        words = s_lower.split()
+        avg_word_len = sum(len(w) for w in words) / max(len(words), 1)
+        # Score IA: más marcadores + palabras largas uniformes = más IA
+        ai_score = min(1.0, (markers_in_sentence * 0.3) + (max(0, avg_word_len - 4) * 0.07))
+        scored.append({"sentence": sentence[:100], "ai_score": round(ai_score, 2)})
+
+    return scored
 
 
 def analyze_text(text: str) -> dict:
-    perplexity = calculate_perplexity(text)
-    burstiness = calculate_burstiness(text)
-    patterns = detect_ai_patterns(text)
+    perplexity = calculate_perplexity_v2(text)
+    burstiness = calculate_burstiness_v2(text)
 
-    # Calcular probabilidad de IA (0-100)
-    # Perplejidad baja + burstiness baja + muchos patrones → alta prob IA
-    perplexity_score = (100 - perplexity) / 100  # Mayor si baja perplejidad
-    burstiness_score = (100 - burstiness) / 100  # Mayor si baja variabilidad
-    pattern_score = min(patterns["patterns_found"] / 5, 1.0)
+    words = text.lower().split()
+    lexical_diversity = len(set(words)) / max(len(words), 1)
 
-    ai_prob = (perplexity_score * 0.4 + burstiness_score * 0.35 + pattern_score * 0.25) * 100
+    # Marcadores encontrados
+    text_lower = text.lower()
+    found_markers = [m for m in AI_MARKERS if m in text_lower]
+
+    # Scores normalizados (0=humano, 1=IA)
+    perplexity_score = (100 - perplexity) / 100
+    burstiness_score = (100 - burstiness) / 100
+    pattern_score = min(len(found_markers) / 10, 1.0)
+    diversity_score = 1 - lexical_diversity
+
+    # Ponderación basada en investigación de GPTZero / Turnitin
+    ai_prob = (
+        perplexity_score * 0.35 +
+        burstiness_score * 0.30 +
+        pattern_score    * 0.20 +
+        diversity_score  * 0.15
+    ) * 100
+
     ai_prob = round(min(99.9, max(0.1, ai_prob)), 1)
     human_prob = round(100 - ai_prob, 1)
 
-    humanizer_detected = patterns["patterns_found"] >= 3
+    # Nivel de confianza (como Turnitin)
+    if ai_prob >= 80 or ai_prob <= 20:
+        confidence = "Alta"
+    elif ai_prob >= 65 or ai_prob <= 35:
+        confidence = "Media"
+    else:
+        confidence = "Baja"
+
+    sentence_scores = analyze_per_sentence(text)
 
     return {
         "ai_probability": ai_prob,
         "human_probability": human_prob,
+        "confidence": confidence,
         "perplexity": round(perplexity, 1),
         "burstiness": round(burstiness, 1),
-        "patterns_found": patterns["patterns"],
-        "humanizer_detected": humanizer_detected,
-        "word_count": len(text.split()),
+        "lexical_diversity": round(lexical_diversity * 100, 1),
+        "patterns_found": found_markers[:8],  # Top 8 marcadores
+        "humanizer_detected": len(found_markers) >= 4,
+        "word_count": len(words),
         "sentence_count": len(re.split(r'(?<=[.!?])\s+', text.strip())),
+        "sentence_analysis": sentence_scores,
     }
 
 
@@ -168,16 +249,20 @@ def analyze_text(text: str) -> dict:
 # ENDPOINTS
 # ─────────────────────────────────────────────
 
-from fastapi import APIRouter
+router = APIRouter()
 
-api_router = APIRouter()
 
-@api_router.get("/health")
+@router.get("/")
+def root():
+    return {"status": "ok", "service": "AI Detector Pro API v2", "version": "2.0.0"}
+
+
+@router.get("/health")
 def health():
-    return {"status": "ok", "service": "AI Detector Pro API"}
+    return {"status": "ok", "service": "AI Detector Pro API v2"}
 
 
-@api_router.get("/supported-formats")
+@router.get("/supported-formats")
 def supported_formats():
     return {
         "formats": list(EXTRACTORS.keys()),
@@ -190,7 +275,7 @@ def supported_formats():
     }
 
 
-@api_router.post("/analyze")
+@router.post("/analyze")
 async def analyze_file(file: UploadFile = File(...)):
     filename = file.filename or "unknown"
     extension = filename.split(".")[-1].lower() if "." in filename else ""
@@ -202,16 +287,16 @@ async def analyze_file(file: UploadFile = File(...)):
         )
 
     content = await file.read()
-    if len(content) > 10 * 1024 * 1024:  # 10 MB limit
+    if len(content) > 10 * 1024 * 1024:  # 10 MB
         raise HTTPException(status_code=413, detail="Archivo demasiado grande. Máximo 10 MB.")
 
     text = EXTRACTORS[extension](content)
 
-    if not text.strip():
+    if not text or not text.strip():
         raise HTTPException(status_code=422, detail="No se pudo extraer texto del archivo.")
 
     if len(text.split()) < 20:
-        raise HTTPException(status_code=422, detail="El archivo tiene muy poco texto para analizar (mínimo 20 palabras).")
+        raise HTTPException(status_code=422, detail="Texto insuficiente (mínimo 20 palabras).")
 
     result = analyze_text(text)
     result["file_name"] = filename
@@ -220,6 +305,6 @@ async def analyze_file(file: UploadFile = File(...)):
 
     return result
 
-# Incluimos las rutas tanto en la raíz como bajo /api (para compatibilidad con Vercel)
-app.include_router(api_router)
-app.include_router(api_router, prefix="/api")
+
+# Registrar rutas — Vercel hace el routing via vercel.json rewrites
+app.include_router(router)
