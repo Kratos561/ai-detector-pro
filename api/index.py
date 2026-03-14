@@ -168,12 +168,16 @@ def analyze_text(text: str) -> dict:
 # ENDPOINTS
 # ─────────────────────────────────────────────
 
-@app.get("/health")
+from fastapi import APIRouter
+
+api_router = APIRouter()
+
+@api_router.get("/health")
 def health():
     return {"status": "ok", "service": "AI Detector Pro API"}
 
 
-@app.get("/supported-formats")
+@api_router.get("/supported-formats")
 def supported_formats():
     return {
         "formats": list(EXTRACTORS.keys()),
@@ -186,7 +190,7 @@ def supported_formats():
     }
 
 
-@app.post("/analyze")
+@api_router.post("/analyze")
 async def analyze_file(file: UploadFile = File(...)):
     filename = file.filename or "unknown"
     extension = filename.split(".")[-1].lower() if "." in filename else ""
@@ -215,3 +219,7 @@ async def analyze_file(file: UploadFile = File(...)):
     result["file_size_kb"] = round(len(content) / 1024, 2)
 
     return result
+
+# Incluimos las rutas tanto en la raíz como bajo /api (para compatibilidad con Vercel)
+app.include_router(api_router)
+app.include_router(api_router, prefix="/api")
