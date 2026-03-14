@@ -1,5 +1,12 @@
 {
   "version": 2,
+  "framework": "vite",
+  "functions": {
+    "api/index.py": {
+      "maxDuration": 30,
+      "memory": 1024
+    }
+  },
   "rewrites": [
     {
       "source": "/api/(.*)",
@@ -9,6 +16,5 @@
       "source": "/(.*)",
       "destination": "/"
     }
-  ],
-  "framework": "vite"
+  ]
 }
